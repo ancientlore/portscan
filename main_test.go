@@ -72,6 +72,33 @@ func TestParsePorts(t *testing.T) {
 	}
 }
 
+func TestResolvePortSelection(t *testing.T) {
+	ports, err := resolvePortSelection("80,443", 5, false, false)
+	if err != nil {
+		t.Fatalf("resolvePortSelection(-top 5) unexpected error: %v", err)
+	}
+	if len(ports) != 5 || !reflect.DeepEqual(ports, topPorts[:5]) {
+		t.Errorf("got %v, want %v", ports, topPorts[:5])
+	}
+
+	all, err := resolvePortSelection("80,443", 0, true, false)
+	if err != nil {
+		t.Fatalf("resolvePortSelection(-all) unexpected error: %v", err)
+	}
+	if len(all) != 65535 || all[0] != 1 || all[len(all)-1] != 65535 {
+		t.Errorf("unexpected -all slice length=%d", len(all))
+	}
+
+	if _, err := resolvePortSelection("80", 10, true, false); err == nil {
+		t.Error("expected error when both -all and -top are set")
+	}
+
+	shuffled, err := resolvePortSelection("1-50", 0, false, true)
+	if err != nil || len(shuffled) != 50 {
+		t.Fatalf("resolvePortSelection(shuffle) = len %d, err %v", len(shuffled), err)
+	}
+}
+
 func TestResolveHost(t *testing.T) {
 	ctx := context.Background()
 
@@ -113,26 +140,48 @@ func TestClassifyError(t *testing.T) {
 	}
 }
 
-func TestScanPortsIntegration(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+func TestScanTCPPortsAndBanners(t *testing.T) {
+	// Server-speaks-first listener (e.g. SSH banner)
+	sshLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("failed to listen: %v", err)
 	}
-	defer ln.Close()
+	defer sshLn.Close()
 
 	go func() {
 		for {
-			conn, err := ln.Accept()
+			conn, err := sshLn.Accept()
 			if err != nil {
 				return
 			}
+			_, _ = conn.Write([]byte("SSH-2.0-OpenSSH_9.9\r\n"))
 			_ = conn.Close()
 		}
 	}()
+	sshPort := sshLn.Addr().(*net.TCPAddr).Port
 
-	openPort := ln.Addr().(*net.TCPAddr).Port
+	// HTTP-style listener (waits for request before responding)
+	httpLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer httpLn.Close()
 
-	// Allocate and immediately close a listener to get a likely closed port.
+	go func() {
+		for {
+			conn, err := httpLn.Accept()
+			if err != nil {
+				return
+			}
+			buf := make([]byte, 256)
+			_, _ = conn.Read(buf)
+			_, _ = conn.Write([]byte("HTTP/1.0 200 OK\r\nServer: TestHTTP/1.0\r\n\r\n"))
+			_ = conn.Close()
+		}
+	}()
+	httpPort := httpLn.Addr().(*net.TCPAddr).Port
+
+	// Closed port
 	closedLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("failed to listen for closed port: %v", err)
@@ -141,18 +190,68 @@ func TestScanPortsIntegration(t *testing.T) {
 	_ = closedLn.Close()
 
 	ctx := context.Background()
-	ch := emitPorts(ctx, []int{openPort, closedPort})
-	results := scanPorts(ctx, "127.0.0.1", ch, 2, 500*time.Millisecond)
+	cfg := ScanConfig{
+		TargetAddr: "127.0.0.1",
+		HostHeader: "localhost",
+		Protocol:   "tcp",
+		Workers:    3,
+		Timeout:    500 * time.Millisecond,
+		GrabBanner: true,
+	}
+	ch := emitPorts(ctx, []int{sshPort, httpPort, closedPort}, 0)
+	results := scanPorts(ctx, cfg, ch)
 
 	got := make(map[int]ScanResult)
 	for res := range results {
 		got[res.Port] = res
 	}
 
-	if !got[openPort].Open() {
-		t.Errorf("expected port %d to be open, got %+v", openPort, got[openPort])
+	if !got[sshPort].Open() || got[sshPort].Banner != "SSH-2.0-OpenSSH_9.9" {
+		t.Errorf("unexpected ssh port result: %+v", got[sshPort])
+	}
+	if !got[httpPort].Open() || got[httpPort].Banner != "HTTP/1.0 200 OK [TestHTTP/1.0]" {
+		t.Errorf("unexpected http port result: %+v", got[httpPort])
 	}
 	if got[closedPort].Status != StatusClosed {
 		t.Errorf("expected port %d to be closed, got %+v", closedPort, got[closedPort])
+	}
+}
+
+func TestScanUDPPort(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen udp: %v", err)
+	}
+	defer pc.Close()
+
+	go func() {
+		buf := make([]byte, 512)
+		for {
+			n, addr, err := pc.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			if n > 0 {
+				_, _ = pc.WriteTo([]byte("PONG-UDP\n"), addr)
+			}
+		}
+	}()
+
+	openUDPPort := pc.LocalAddr().(*net.UDPAddr).Port
+
+	ctx := context.Background()
+	cfg := ScanConfig{
+		TargetAddr: "127.0.0.1",
+		Protocol:   "udp",
+		Workers:    1,
+		Timeout:    300 * time.Millisecond,
+		GrabBanner: true,
+	}
+	ch := emitPorts(ctx, []int{openUDPPort}, 0)
+	results := scanPorts(ctx, cfg, ch)
+
+	res := <-results
+	if !res.Open() || res.Banner != "PONG-UDP" {
+		t.Errorf("expected open UDP port with banner PONG-UDP, got %+v", res)
 	}
 }

@@ -1,5 +1,5 @@
 /*
-portscan is a simple port scanner that tries to open a range of TCP connections to the given host.
+portscan is a simple port scanner that tries to open a range of TCP or UDP connections to the given host.
 */
 package main
 
@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"math/rand/v2"
 	"net"
 	"os"
 	"os/signal"
@@ -19,11 +20,17 @@ import (
 )
 
 var (
-	host     = flag.String("host", "localhost", "Host or IP to scan")
-	timeout  = flag.Duration("timeout", 1*time.Second, "Timeout per port")
-	ports    = flag.String("range", "80,443", "Port ranges e.g. 80,443,200-1000,8000-9000")
-	threads  = flag.Int("threads", 100, "Threads to use")
-	showErrs = flag.Bool("verbose", false, "Show errors for failed ports")
+	host      = flag.String("host", "localhost", "Host or IP to scan")
+	timeout   = flag.Duration("timeout", 1*time.Second, "Timeout per port")
+	ports     = flag.String("range", "80,443", "Port ranges e.g. 80,443,200-1000,8000-9000")
+	topN      = flag.Int("top", 0, "Scan the top N most common ports (1-100)")
+	allPorts  = flag.Bool("all", false, "Scan all ports (1-65535)")
+	udpMode   = flag.Bool("udp", false, "Scan UDP ports instead of TCP")
+	banner    = flag.Bool("banner", false, "Grab service banners on open ports")
+	rateLimit = flag.Int("rate", 0, "Max port probes per second (0 for unlimited)")
+	shuffle   = flag.Bool("shuffle", false, "Randomize port scan order")
+	threads   = flag.Int("threads", 100, "Threads to use")
+	showErrs  = flag.Bool("verbose", false, "Show errors for failed ports")
 )
 
 const (
@@ -36,6 +43,7 @@ type PortStatus string
 
 const (
 	StatusOpen              PortStatus = "open"
+	StatusOpenFiltered      PortStatus = "open|filtered"
 	StatusClosed            PortStatus = "closed"
 	StatusFiltered          PortStatus = "filtered"
 	StatusResourceExhausted PortStatus = "resource_exhausted"
@@ -43,33 +51,60 @@ const (
 	StatusError             PortStatus = "error"
 )
 
-// ScanResult holds the structured result of a single port scan.
-type ScanResult struct {
-	Port    int
-	Status  PortStatus
-	Latency time.Duration
-	Err     error
+// ScanConfig configures how ports are scanned.
+type ScanConfig struct {
+	TargetAddr string
+	HostHeader string
+	Protocol   string
+	Workers    int
+	Timeout    time.Duration
+	GrabBanner bool
 }
 
-// Open reports whether the scanned port accepted a TCP connection.
+// ScanResult holds the structured result of a single port scan.
+type ScanResult struct {
+	Port     int
+	Protocol string
+	Service  string
+	Banner   string
+	Status   PortStatus
+	Latency  time.Duration
+	Err      error
+}
+
+// Open reports whether the scanned port is confirmed open.
 func (r ScanResult) Open() bool {
 	return r.Status == StatusOpen
 }
 
 func (r ScanResult) String() string {
+	proto := r.Protocol
+	if proto == "" {
+		proto = "tcp"
+	}
+	svc := ""
+	if r.Service != "" {
+		svc = " " + r.Service
+	}
 	if r.Open() {
-		return fmt.Sprintf("%d: OK (%s)", r.Port, r.Latency.Round(time.Microsecond))
+		if r.Banner != "" {
+			return fmt.Sprintf("%d/%s%s: OK (%s) [%s]", r.Port, proto, svc, r.Latency.Round(time.Microsecond), r.Banner)
+		}
+		return fmt.Sprintf("%d/%s%s: OK (%s)", r.Port, proto, svc, r.Latency.Round(time.Microsecond))
+	}
+	if r.Status == StatusOpenFiltered {
+		return fmt.Sprintf("%d/%s%s: [%s] no UDP response within %s", r.Port, proto, svc, r.Status, r.Latency.Round(time.Millisecond))
 	}
 	if r.Status == StatusResourceExhausted {
-		return fmt.Sprintf("%d: [%s] %v (hint: lower -threads or increase ulimit -n)", r.Port, r.Status, r.Err)
+		return fmt.Sprintf("%d/%s%s: [%s] %v (hint: lower -threads or increase ulimit -n)", r.Port, proto, svc, r.Status, r.Err)
 	}
 	if r.Err != nil {
-		return fmt.Sprintf("%d: [%s] %v", r.Port, r.Status, r.Err)
+		return fmt.Sprintf("%d/%s%s: [%s] %v", r.Port, proto, svc, r.Status, r.Err)
 	}
-	return fmt.Sprintf("%d: [%s]", r.Port, r.Status)
+	return fmt.Sprintf("%d/%s%s: [%s]", r.Port, proto, svc, r.Status)
 }
 
-// classifyError inspects a dial error and categorizes it into a PortStatus.
+// classifyError inspects a dial/read error and categorizes it into a PortStatus.
 func classifyError(err error) PortStatus {
 	if err == nil {
 		return StatusOpen
@@ -88,6 +123,40 @@ func classifyError(err error) PortStatus {
 		return StatusFiltered
 	}
 	return StatusError
+}
+
+// resolvePortSelection determines the final port list from presets (-all, -top) or -range,
+// and optionally shuffles the resulting slice.
+func resolvePortSelection(rangeSpec string, top int, all bool, randomize bool) ([]int, error) {
+	var portList []int
+	var err error
+
+	switch {
+	case all && top > 0:
+		return nil, errors.New("cannot specify both -all and -top")
+	case all:
+		portList = make([]int, maxPort)
+		for i := range portList {
+			portList[i] = i + 1
+		}
+	case top > 0:
+		if top > len(topPorts) {
+			return nil, fmt.Errorf("-top must be between 1 and %d (got %d)", len(topPorts), top)
+		}
+		portList = append([]int(nil), topPorts[:top]...)
+	default:
+		portList, err = parsePorts(rangeSpec)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if randomize {
+		rand.Shuffle(len(portList), func(i, j int) {
+			portList[i], portList[j] = portList[j], portList[i]
+		})
+	}
+	return portList, nil
 }
 
 // parsePorts parses, validates, and deduplicates a comma-separated list of ports and port ranges.
@@ -180,11 +249,30 @@ func resolveHost(ctx context.Context, target string, timeout time.Duration) (str
 	return addrs[0].IP.String(), nil
 }
 
-func emitPorts(ctx context.Context, portList []int) <-chan int {
+// emitPorts feeds ports to workers, applying an optional rate limit (ports per second).
+func emitPorts(ctx context.Context, portList []int, maxPerSec int) <-chan int {
 	c := make(chan int)
 	go func() {
 		defer close(c)
-		for _, port := range portList {
+
+		var ticker *time.Ticker
+		if maxPerSec > 0 {
+			interval := time.Second / time.Duration(maxPerSec)
+			if interval <= 0 {
+				interval = time.Nanosecond
+			}
+			ticker = time.NewTicker(interval)
+			defer ticker.Stop()
+		}
+
+		for i, port := range portList {
+			if ticker != nil && i > 0 {
+				select {
+				case <-ticker.C:
+				case <-ctx.Done():
+					return
+				}
+			}
 			select {
 			case c <- port:
 			case <-ctx.Done():
@@ -195,13 +283,17 @@ func emitPorts(ctx context.Context, portList []int) <-chan int {
 	return c
 }
 
-func scanPorts(ctx context.Context, targetAddr string, portChan <-chan int, numWorkers int, dialTimeout time.Duration) <-chan ScanResult {
+func scanPorts(ctx context.Context, cfg ScanConfig, portChan <-chan int) <-chan ScanResult {
 	out := make(chan ScanResult)
+	numWorkers := cfg.Workers
 	if numWorkers <= 0 {
 		numWorkers = 1
 	}
+	if cfg.Protocol == "" {
+		cfg.Protocol = "tcp"
+	}
 
-	dialer := &net.Dialer{Timeout: dialTimeout}
+	dialer := &net.Dialer{Timeout: cfg.Timeout}
 	var wg sync.WaitGroup
 	wg.Add(numWorkers)
 
@@ -214,7 +306,12 @@ func scanPorts(ctx context.Context, targetAddr string, portChan <-chan int, numW
 					if !ok {
 						return
 					}
-					res := scanPort(ctx, dialer, targetAddr, port)
+					var res ScanResult
+					if cfg.Protocol == "udp" {
+						res = scanUDPPort(ctx, dialer, cfg.TargetAddr, port, cfg.Timeout, cfg.GrabBanner)
+					} else {
+						res = scanTCPPort(ctx, dialer, cfg, port)
+					}
 					select {
 					case out <- res:
 					case <-ctx.Done():
@@ -234,24 +331,40 @@ func scanPorts(ctx context.Context, targetAddr string, portChan <-chan int, numW
 	return out
 }
 
-func scanPort(ctx context.Context, dialer *net.Dialer, targetHost string, port int) ScanResult {
-	addr := net.JoinHostPort(targetHost, strconv.Itoa(port))
+func scanTCPPort(ctx context.Context, dialer *net.Dialer, cfg ScanConfig, port int) ScanResult {
+	addr := net.JoinHostPort(cfg.TargetAddr, strconv.Itoa(port))
+	svc := lookupService("tcp", port)
 	start := time.Now()
 	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	latency := time.Since(start)
 	if err != nil {
 		return ScanResult{
-			Port:    port,
-			Status:  classifyError(err),
-			Latency: latency,
-			Err:     err,
+			Port:     port,
+			Protocol: "tcp",
+			Service:  svc,
+			Status:   classifyError(err),
+			Latency:  latency,
+			Err:      err,
 		}
 	}
-	_ = conn.Close()
+	defer conn.Close()
+
+	var bannerText string
+	if cfg.GrabBanner {
+		hostHdr := cfg.HostHeader
+		if hostHdr == "" {
+			hostHdr = cfg.TargetAddr
+		}
+		bannerText = grabTCPBanner(ctx, conn, hostHdr, port, cfg.Timeout)
+	}
+
 	return ScanResult{
-		Port:    port,
-		Status:  StatusOpen,
-		Latency: latency,
+		Port:     port,
+		Protocol: "tcp",
+		Service:  svc,
+		Banner:   bannerText,
+		Status:   StatusOpen,
+		Latency:  latency,
 	}
 }
 
@@ -265,6 +378,12 @@ func validateFlags() error {
 	if *timeout <= 0 {
 		return fmt.Errorf("-timeout must be greater than 0 (got %s)", *timeout)
 	}
+	if *topN < 0 || *topN > len(topPorts) {
+		return fmt.Errorf("-top must be between 1 and %d (got %d)", len(topPorts), *topN)
+	}
+	if *rateLimit < 0 {
+		return fmt.Errorf("-rate cannot be negative (got %d)", *rateLimit)
+	}
 	return nil
 }
 
@@ -276,9 +395,9 @@ func main() {
 		os.Exit(2)
 	}
 
-	portList, err := parsePorts(*ports)
+	portList, err := resolvePortSelection(*ports, *topN, *allPorts, *shuffle)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error parsing -range: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error selecting ports: %v\n", err)
 		os.Exit(2)
 	}
 
@@ -296,14 +415,28 @@ func main() {
 		workers = len(portList)
 	}
 
+	proto := "tcp"
+	if *udpMode {
+		proto = "udp"
+	}
+
 	hostDisplay := *host
 	if resolvedIP != *host {
 		hostDisplay = fmt.Sprintf("%s (%s)", *host, resolvedIP)
 	}
-	fmt.Printf("Scanning %s (%d ports) timeout %s threads %d\n", hostDisplay, len(portList), (*timeout).String(), workers)
+	fmt.Printf("Scanning %s (%d %s ports) timeout %s threads %d\n", hostDisplay, len(portList), strings.ToUpper(proto), (*timeout).String(), workers)
 
-	portChan := emitPorts(ctx, portList)
-	results := scanPorts(ctx, resolvedIP, portChan, workers, *timeout)
+	cfg := ScanConfig{
+		TargetAddr: resolvedIP,
+		HostHeader: *host,
+		Protocol:   proto,
+		Workers:    workers,
+		Timeout:    *timeout,
+		GrabBanner: *banner,
+	}
+
+	portChan := emitPorts(ctx, portList, *rateLimit)
+	results := scanPorts(ctx, cfg, portChan)
 
 	warnedFDLimit := false
 	for res := range results {
@@ -311,7 +444,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Warning: file descriptor limit reached (%v); try lowering -threads or raising ulimit -n\n", res.Err)
 			warnedFDLimit = true
 		}
-		if *showErrs || res.Open() {
+		if *showErrs || res.Open() || (*udpMode && res.Status == StatusOpenFiltered) {
 			fmt.Println(res)
 		}
 	}
