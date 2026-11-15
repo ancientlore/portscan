@@ -38,7 +38,7 @@ Usage of portscan:
   -timeout duration
     	Timeout per port (default 1s)
   -top int
-    	Scan the top N most common ports (1-100)
+    	Scan the top N most common ports (1-120)
   -udp
     	Scan UDP ports instead of TCP
   -verbose

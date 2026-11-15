@@ -77,6 +77,20 @@ func TestParsePorts(t *testing.T) {
 }
 
 func TestResolvePortSelection(t *testing.T) {
+	seen := make(map[int]bool, len(topPorts))
+	for i, p := range topPorts {
+		if p < minPort || p > maxPort {
+			t.Errorf("topPorts[%d] = %d out of valid range", i, p)
+		}
+		if seen[p] {
+			t.Errorf("duplicate port %d in topPorts at index %d", p, i)
+		}
+		seen[p] = true
+		if lookupService("tcp", p) == "" {
+			t.Errorf("topPorts[%d] = %d is missing an entry in tcpServices", i, p)
+		}
+	}
+
 	ports, err := resolvePortSelection("80,443", 5, false, false)
 	if err != nil {
 		t.Fatalf("resolvePortSelection(-top 5) unexpected error: %v", err)

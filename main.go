@@ -25,7 +25,7 @@ var (
 	ipv6Only  = flag.Bool("6", false, "Force IPv6 resolution and scanning")
 	timeout   = flag.Duration("timeout", 1*time.Second, "Timeout per port")
 	ports     = flag.String("range", "80,443", "Port ranges e.g. 80,443,200-1000,8000-9000")
-	topN      = flag.Int("top", 0, "Scan the top N most common ports (1-100)")
+	topN      = flag.Int("top", 0, fmt.Sprintf("Scan the top N most common ports (1-%d)", len(topPorts)))
 	allPorts  = flag.Bool("all", false, "Scan all ports (1-65535)")
 	udpMode   = flag.Bool("udp", false, "Scan UDP ports instead of TCP")
 	banner    = flag.Bool("banner", false, "Grab service banners on open ports")
