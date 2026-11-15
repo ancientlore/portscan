@@ -13,6 +13,8 @@
 
 ```text
 Usage of portscan:
+  -4	Force IPv4 resolution and scanning
+  -6	Force IPv6 resolution and scanning
   -all
     	Scan all ports (1-65535)
   -banner

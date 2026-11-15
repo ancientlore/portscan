@@ -357,10 +357,11 @@ func udpPayloadForPort(port int) []byte {
 
 // scanUDPPort probes a single UDP port using a connected UDP socket so ICMP Port Unreachable
 // errors surface as ECONNREFUSED on Read.
-func scanUDPPort(ctx context.Context, dialer *net.Dialer, targetHost string, port int, timeout time.Duration, wantBanner bool) ScanResult {
-	addr := net.JoinHostPort(targetHost, strconv.Itoa(port))
+func scanUDPPort(ctx context.Context, dialer *net.Dialer, cfg ScanConfig, port int) ScanResult {
+	addr := net.JoinHostPort(cfg.TargetAddr, strconv.Itoa(port))
+	network := dialNetwork("udp", cfg.IPVersion)
 	start := time.Now()
-	conn, err := dialer.DialContext(ctx, "udp", addr)
+	conn, err := dialer.DialContext(ctx, network, addr)
 	if err != nil {
 		return ScanResult{
 			Port:     port,
@@ -373,7 +374,7 @@ func scanUDPPort(ctx context.Context, dialer *net.Dialer, targetHost string, por
 	}
 	defer conn.Close()
 
-	deadline := time.Now().Add(timeout)
+	deadline := time.Now().Add(cfg.Timeout)
 	if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {
 		deadline = dl
 	}
@@ -411,7 +412,7 @@ func scanUDPPort(ctx context.Context, dialer *net.Dialer, targetHost string, por
 	}
 
 	var banner string
-	if wantBanner && n > 0 {
+	if cfg.GrabBanner && n > 0 {
 		banner = sanitizeBanner(string(buf[:n]))
 	}
 	return ScanResult{

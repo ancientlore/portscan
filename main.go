@@ -21,6 +21,8 @@ import (
 
 var (
 	host      = flag.String("host", "localhost", "Host or IP to scan")
+	ipv4Only  = flag.Bool("4", false, "Force IPv4 resolution and scanning")
+	ipv6Only  = flag.Bool("6", false, "Force IPv6 resolution and scanning")
 	timeout   = flag.Duration("timeout", 1*time.Second, "Timeout per port")
 	ports     = flag.String("range", "80,443", "Port ranges e.g. 80,443,200-1000,8000-9000")
 	topN      = flag.Int("top", 0, "Scan the top N most common ports (1-100)")
@@ -59,9 +61,21 @@ type ScanConfig struct {
 	TargetAddr string
 	HostHeader string
 	Protocol   string
+	IPVersion  int // 0 (any), 4 (IPv4 only), or 6 (IPv6 only)
 	Workers    int
 	Timeout    time.Duration
 	GrabBanner bool
+}
+
+func dialNetwork(proto string, ipVersion int) string {
+	switch ipVersion {
+	case 4:
+		return proto + "4"
+	case 6:
+		return proto + "6"
+	default:
+		return proto
+	}
 }
 
 // ScanResult holds the structured result of a single port scan.
@@ -219,37 +233,81 @@ func parsePorts(r string) ([]int, error) {
 }
 
 // resolveHost resolves a hostname once to avoid redundant DNS lookups per port.
-// If the input is already an IP literal, it is returned directly without brackets.
-func resolveHost(ctx context.Context, target string, timeout time.Duration) (string, error) {
+// ipVersion may be 0 (default: prefer IPv4, fallback to IPv6), 4 (IPv4 only), or 6 (IPv6 only).
+// If the input is already an IP literal, it is validated against ipVersion and returned without brackets.
+func resolveHost(ctx context.Context, target string, timeout time.Duration, ipVersion int) (string, error) {
 	trimmed := strings.TrimSpace(target)
 	if trimmed == "" {
 		return "", errors.New("host cannot be empty")
+	}
+	if ipVersion != 0 && ipVersion != 4 && ipVersion != 6 {
+		return "", fmt.Errorf("invalid IP version %d", ipVersion)
 	}
 
 	// Strip surrounding brackets if an IPv6 literal like "[::1]" was passed.
 	unbracketed := strings.TrimPrefix(strings.TrimSuffix(trimmed, "]"), "[")
 	if ip := net.ParseIP(unbracketed); ip != nil {
+		isV4 := ip.To4() != nil
+		if ipVersion == 4 && !isV4 {
+			return "", fmt.Errorf("host %q is an IPv6 address, but -4 was specified", trimmed)
+		}
+		if ipVersion == 6 && isV4 {
+			return "", fmt.Errorf("host %q is an IPv4 address, but -6 was specified", trimmed)
+		}
 		return ip.String(), nil
 	}
 
 	resolveCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	addrs, err := net.DefaultResolver.LookupIPAddr(resolveCtx, trimmed)
-	if err != nil {
-		return "", fmt.Errorf("failed to resolve host %q: %w", trimmed, err)
-	}
-	if len(addrs) == 0 {
-		return "", fmt.Errorf("no IP addresses found for host %q", trimmed)
-	}
-
-	// Prefer IPv4 if available, otherwise take the first resolved address.
-	for _, addr := range addrs {
-		if ipv4 := addr.IP.To4(); ipv4 != nil {
-			return ipv4.String(), nil
+	switch ipVersion {
+	case 4:
+		ips, err := net.DefaultResolver.LookupIP(resolveCtx, "ip4", trimmed)
+		if err != nil {
+			return "", fmt.Errorf("failed to resolve IPv4 address for host %q: %w", trimmed, err)
 		}
+		for _, ip := range ips {
+			if ipv4 := ip.To4(); ipv4 != nil {
+				return ipv4.String(), nil
+			}
+		}
+		return "", fmt.Errorf("no IPv4 addresses found for host %q", trimmed)
+
+	case 6:
+		ips, err := net.DefaultResolver.LookupIP(resolveCtx, "ip6", trimmed)
+		if err != nil {
+			if strings.EqualFold(trimmed, "localhost") {
+				return "::1", nil
+			}
+			return "", fmt.Errorf("failed to resolve IPv6 address for host %q: %w", trimmed, err)
+		}
+		for _, ip := range ips {
+			if ip.To4() == nil && ip.To16() != nil {
+				return ip.String(), nil
+			}
+		}
+		if strings.EqualFold(trimmed, "localhost") {
+			return "::1", nil
+		}
+		return "", fmt.Errorf("no IPv6 addresses found for host %q", trimmed)
+
+	default:
+		addrs, err := net.DefaultResolver.LookupIPAddr(resolveCtx, trimmed)
+		if err != nil {
+			return "", fmt.Errorf("failed to resolve host %q: %w", trimmed, err)
+		}
+		if len(addrs) == 0 {
+			return "", fmt.Errorf("no IP addresses found for host %q", trimmed)
+		}
+
+		// Prefer IPv4 if available, otherwise take the first resolved address.
+		for _, addr := range addrs {
+			if ipv4 := addr.IP.To4(); ipv4 != nil {
+				return ipv4.String(), nil
+			}
+		}
+		return addrs[0].IP.String(), nil
 	}
-	return addrs[0].IP.String(), nil
 }
 
 // emitPorts feeds ports to workers, applying an optional rate limit (ports per second).
@@ -311,7 +369,7 @@ func scanPorts(ctx context.Context, cfg ScanConfig, portChan <-chan int) <-chan 
 					}
 					var res ScanResult
 					if cfg.Protocol == "udp" {
-						res = scanUDPPort(ctx, dialer, cfg.TargetAddr, port, cfg.Timeout, cfg.GrabBanner)
+						res = scanUDPPort(ctx, dialer, cfg, port)
 					} else {
 						res = scanTCPPort(ctx, dialer, cfg, port)
 					}
@@ -337,8 +395,9 @@ func scanPorts(ctx context.Context, cfg ScanConfig, portChan <-chan int) <-chan 
 func scanTCPPort(ctx context.Context, dialer *net.Dialer, cfg ScanConfig, port int) ScanResult {
 	addr := net.JoinHostPort(cfg.TargetAddr, strconv.Itoa(port))
 	svc := lookupService("tcp", port)
+	network := dialNetwork("tcp", cfg.IPVersion)
 	start := time.Now()
-	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	conn, err := dialer.DialContext(ctx, network, addr)
 	latency := time.Since(start)
 	if err != nil {
 		return ScanResult{
@@ -375,6 +434,9 @@ func validateFlags() error {
 	if strings.TrimSpace(*host) == "" {
 		return errors.New("-host cannot be empty")
 	}
+	if *ipv4Only && *ipv6Only {
+		return errors.New("cannot specify both -4 and -6")
+	}
 	if *threads <= 0 {
 		return fmt.Errorf("-threads must be greater than 0 (got %d)", *threads)
 	}
@@ -391,6 +453,16 @@ func validateFlags() error {
 		return errors.New("cannot specify both -json and -csv")
 	}
 	return nil
+}
+
+func selectedIPVersion(v4, v6 bool) int {
+	if v4 {
+		return 4
+	}
+	if v6 {
+		return 6
+	}
+	return 0
 }
 
 func main() {
@@ -413,7 +485,8 @@ func main() {
 	scanCtx, cancelScan := context.WithCancel(ctx)
 	defer cancelScan()
 
-	resolvedIP, err := resolveHost(scanCtx, *host, *timeout)
+	ipVer := selectedIPVersion(*ipv4Only, *ipv6Only)
+	resolvedIP, err := resolveHost(scanCtx, *host, *timeout, ipVer)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -433,6 +506,7 @@ func main() {
 		TargetAddr: resolvedIP,
 		HostHeader: *host,
 		Protocol:   proto,
+		IPVersion:  ipVer,
 		Workers:    workers,
 		Timeout:    *timeout,
 		GrabBanner: *banner,

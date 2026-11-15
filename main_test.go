@@ -106,23 +106,53 @@ func TestResolvePortSelection(t *testing.T) {
 func TestResolveHost(t *testing.T) {
 	ctx := context.Background()
 
-	ip4, err := resolveHost(ctx, "127.0.0.1", time.Second)
+	ip4, err := resolveHost(ctx, "127.0.0.1", time.Second, 0)
 	if err != nil || ip4 != "127.0.0.1" {
-		t.Fatalf("resolveHost(127.0.0.1) = %q, %v", ip4, err)
+		t.Fatalf("resolveHost(127.0.0.1, 0) = %q, %v", ip4, err)
 	}
 
-	ip6, err := resolveHost(ctx, "::1", time.Second)
+	ip6, err := resolveHost(ctx, "::1", time.Second, 0)
 	if err != nil || ip6 != "::1" {
-		t.Fatalf("resolveHost(::1) = %q, %v", ip6, err)
+		t.Fatalf("resolveHost(::1, 0) = %q, %v", ip6, err)
 	}
 
-	ip6Bracketed, err := resolveHost(ctx, "[::1]", time.Second)
+	ip6Bracketed, err := resolveHost(ctx, "[::1]", time.Second, 6)
 	if err != nil || ip6Bracketed != "::1" {
-		t.Fatalf("resolveHost([::1]) = %q, %v", ip6Bracketed, err)
+		t.Fatalf("resolveHost([::1], 6) = %q, %v", ip6Bracketed, err)
 	}
 
-	if _, err := resolveHost(ctx, "", time.Second); err == nil {
+	// Forcing -4 on an IPv6 literal must fail
+	if _, err := resolveHost(ctx, "::1", time.Second, 4); err == nil {
+		t.Fatal("expected error for IPv6 literal with ipVersion=4")
+	}
+
+	// Forcing -6 on an IPv4 literal must fail
+	if _, err := resolveHost(ctx, "127.0.0.1", time.Second, 6); err == nil {
+		t.Fatal("expected error for IPv4 literal with ipVersion=6")
+	}
+
+	// Resolving localhost with -4 and -6
+	local4, err := resolveHost(ctx, "localhost", time.Second, 4)
+	if err != nil || local4 != "127.0.0.1" {
+		t.Fatalf("resolveHost(localhost, 4) = %q, %v", local4, err)
+	}
+	local6, err := resolveHost(ctx, "localhost", time.Second, 6)
+	if err != nil || local6 != "::1" {
+		t.Fatalf("resolveHost(localhost, 6) = %q, %v", local6, err)
+	}
+
+	if _, err := resolveHost(ctx, "", time.Second, 0); err == nil {
 		t.Fatal("expected error for empty host")
+	}
+
+	if got := selectedIPVersion(true, false); got != 4 {
+		t.Errorf("selectedIPVersion(true, false) = %d, want 4", got)
+	}
+	if got := selectedIPVersion(false, true); got != 6 {
+		t.Errorf("selectedIPVersion(false, true) = %d, want 6", got)
+	}
+	if got := selectedIPVersion(false, false); got != 0 {
+		t.Errorf("selectedIPVersion(false, false) = %d, want 0", got)
 	}
 }
 
