@@ -1,10 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/csv"
+	"encoding/json"
 	"fmt"
 	"net"
 	"reflect"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -253,5 +257,71 @@ func TestScanUDPPort(t *testing.T) {
 	res := <-results
 	if !res.Open() || res.Banner != "PONG-UDP" {
 		t.Errorf("expected open UDP port with banner PONG-UDP, got %+v", res)
+	}
+}
+
+func TestInsertSortedAndReportFormats(t *testing.T) {
+	var list []ScanResult
+	for _, p := range []int{443, 22, 8080, 80} {
+		list = insertSortedResult(list, ScanResult{
+			Port:     p,
+			Protocol: "tcp",
+			Service:  lookupService("tcp", p),
+			Status:   StatusOpen,
+			Latency:  1500 * time.Microsecond,
+			Banner:   "test-banner",
+		})
+	}
+
+	wantPorts := []int{22, 80, 443, 8080}
+	for i, want := range wantPorts {
+		if list[i].Port != want {
+			t.Fatalf("list[%d].Port = %d, want %d", i, list[i].Port, want)
+		}
+	}
+
+	sum := ScanSummary{
+		Host:         "localhost",
+		ResolvedIP:   "127.0.0.1",
+		Protocol:     "tcp",
+		TotalPorts:   4,
+		ScannedPorts: 4,
+		Open:         4,
+		StartedAt:    time.Now(),
+		Duration:     10 * time.Millisecond,
+		DurationMs:   10,
+	}
+
+	var jsonBuf bytes.Buffer
+	if err := writeJSONReport(&jsonBuf, sum, list); err != nil {
+		t.Fatalf("writeJSONReport failed: %v", err)
+	}
+	var parsed JSONReport
+	if err := json.Unmarshal(jsonBuf.Bytes(), &parsed); err != nil {
+		t.Fatalf("failed to unmarshal JSON report: %v", err)
+	}
+	if parsed.Summary.Open != 4 || len(parsed.Results) != 4 || parsed.Results[0].Port != 22 {
+		t.Errorf("unexpected JSON report content: %+v", parsed)
+	}
+
+	var csvBuf bytes.Buffer
+	if err := writeCSVReport(&csvBuf, list); err != nil {
+		t.Fatalf("writeCSVReport failed: %v", err)
+	}
+	records, err := csv.NewReader(&csvBuf).ReadAll()
+	if err != nil {
+		t.Fatalf("failed to parse CSV output: %v", err)
+	}
+	if len(records) != 5 || records[1][0] != "22" || records[1][3] != "ssh" {
+		t.Errorf("unexpected CSV records: %v", records)
+	}
+
+	var tableBuf bytes.Buffer
+	printFinalScrollbackReport(&tableBuf, sum, ScanConfig{Protocol: "tcp", Workers: 4, Timeout: time.Second, GrabBanner: true}, list, false)
+	rendered := tableBuf.String()
+	for _, expected := range []string{"PORTSCAN", "22", "80", "443", "8080", "OPEN", "test-banner"} {
+		if !strings.Contains(rendered, expected) {
+			t.Errorf("expected scrollback report to contain %q, got:\n%s", expected, rendered)
+		}
 	}
 }

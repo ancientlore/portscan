@@ -31,6 +31,9 @@ var (
 	shuffle   = flag.Bool("shuffle", false, "Randomize port scan order")
 	threads   = flag.Int("threads", 100, "Threads to use")
 	showErrs  = flag.Bool("verbose", false, "Show errors for failed ports")
+	jsonOut   = flag.Bool("json", false, "Output results as JSON")
+	csvOut    = flag.Bool("csv", false, "Output results as CSV")
+	noTUI     = flag.Bool("no-tui", false, "Disable live interactive TUI")
 )
 
 const (
@@ -384,6 +387,9 @@ func validateFlags() error {
 	if *rateLimit < 0 {
 		return fmt.Errorf("-rate cannot be negative (got %d)", *rateLimit)
 	}
+	if *jsonOut && *csvOut {
+		return errors.New("cannot specify both -json and -csv")
+	}
 	return nil
 }
 
@@ -404,7 +410,10 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	resolvedIP, err := resolveHost(ctx, *host, *timeout)
+	scanCtx, cancelScan := context.WithCancel(ctx)
+	defer cancelScan()
+
+	resolvedIP, err := resolveHost(scanCtx, *host, *timeout)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -420,12 +429,6 @@ func main() {
 		proto = "udp"
 	}
 
-	hostDisplay := *host
-	if resolvedIP != *host {
-		hostDisplay = fmt.Sprintf("%s (%s)", *host, resolvedIP)
-	}
-	fmt.Printf("Scanning %s (%d %s ports) timeout %s threads %d\n", hostDisplay, len(portList), strings.ToUpper(proto), (*timeout).String(), workers)
-
 	cfg := ScanConfig{
 		TargetAddr: resolvedIP,
 		HostHeader: *host,
@@ -435,18 +438,34 @@ func main() {
 		GrabBanner: *banner,
 	}
 
-	portChan := emitPorts(ctx, portList, *rateLimit)
-	results := scanPorts(ctx, cfg, portChan)
+	portChan := emitPorts(scanCtx, portList, *rateLimit)
+	results := scanPorts(scanCtx, cfg, portChan)
 
-	warnedFDLimit := false
-	for res := range results {
-		if res.Status == StatusResourceExhausted && !warnedFDLimit {
-			fmt.Fprintf(os.Stderr, "Warning: file descriptor limit reached (%v); try lowering -threads or raising ulimit -n\n", res.Err)
-			warnedFDLimit = true
+	if isStdoutTTY() && !*noTUI && !*jsonOut && !*csvOut {
+		if err := runInteractiveTUI(scanCtx, cancelScan, cfg, len(portList), *showErrs, results); err != nil {
+			fmt.Fprintf(os.Stderr, "Error running UI: %v\n", err)
+			os.Exit(1)
 		}
-		if *showErrs || res.Open() || (*udpMode && res.Status == StatusOpenFiltered) {
-			fmt.Println(res)
+		return
+	}
+
+	summary, displayed := collectScanHeadless(cfg, len(portList), *showErrs, results)
+	if scanCtx.Err() != nil {
+		summary.Canceled = true
+	}
+
+	switch {
+	case *jsonOut:
+		if err := writeJSONReport(os.Stdout, summary, displayed); err != nil {
+			fmt.Fprintf(os.Stderr, "Error writing JSON: %v\n", err)
+			os.Exit(1)
 		}
+	case *csvOut:
+		if err := writeCSVReport(os.Stdout, displayed); err != nil {
+			fmt.Fprintf(os.Stderr, "Error writing CSV: %v\n", err)
+			os.Exit(1)
+		}
+	default:
+		printFinalScrollbackReport(os.Stdout, summary, cfg, displayed, *showErrs)
 	}
 }
-
