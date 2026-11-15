@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strconv"
 	"strings"
@@ -401,26 +403,17 @@ func grabTCPBanner(ctx context.Context, conn net.Conn, hostHeader string, port i
 	if n > 0 {
 		return sanitizeBanner(string(buf[:n]))
 	}
-	if err != nil {
-		var netErr net.Error
-		if ok := isTimeoutErr(err, &netErr); !ok {
-			return ""
-		}
+	if err != nil && !isTimeoutErr(err) {
+		return ""
 	}
 
 	// Fallback: send an HTTP HEAD probe for silent servers (HTTP, proxies, etc.).
 	return sanitizeBanner(probeHTTP(conn, hostHeader, deadline))
 }
 
-func isTimeoutErr(err error, netErr *net.Error) bool {
-	if err == nil {
-		return false
-	}
-	if ne, ok := err.(net.Error); ok && ne.Timeout() {
-		*netErr = ne
-		return true
-	}
-	return false
+func isTimeoutErr(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 func probeHTTP(conn net.Conn, hostHeader string, deadline time.Time) string {
@@ -430,7 +423,7 @@ func probeHTTP(conn net.Conn, hostHeader string, deadline time.Time) string {
 		return ""
 	}
 
-	reader := bufio.NewReader(ioLimitReader(conn, 2048))
+	reader := bufio.NewReader(io.LimitReader(conn, 2048))
 	statusLine, err := reader.ReadString('\n')
 	statusLine = strings.TrimSpace(statusLine)
 	if err != nil && statusLine == "" {
@@ -460,27 +453,6 @@ func probeHTTP(conn net.Conn, hostHeader string, deadline time.Time) string {
 		return fmt.Sprintf("%s [%s]", statusLine, serverHeader)
 	}
 	return statusLine
-}
-
-type limitedConnReader struct {
-	r net.Conn
-	n int
-}
-
-func ioLimitReader(r net.Conn, n int) *limitedConnReader {
-	return &limitedConnReader{r: r, n: n}
-}
-
-func (l *limitedConnReader) Read(p []byte) (int, error) {
-	if l.n <= 0 {
-		return 0, fmt.Errorf("limit reached")
-	}
-	if len(p) > l.n {
-		p = p[:l.n]
-	}
-	n, err := l.r.Read(p)
-	l.n -= n
-	return n, err
 }
 
 // udpPayloadForPort returns a protocol-specific datagram for well-known UDP ports,

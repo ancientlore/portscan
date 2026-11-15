@@ -94,33 +94,6 @@ func (r ScanResult) Open() bool {
 	return r.Status == StatusOpen
 }
 
-func (r ScanResult) String() string {
-	proto := r.Protocol
-	if proto == "" {
-		proto = "tcp"
-	}
-	svc := ""
-	if r.Service != "" {
-		svc = " " + r.Service
-	}
-	if r.Open() {
-		if r.Banner != "" {
-			return fmt.Sprintf("%d/%s%s: OK (%s) [%s]", r.Port, proto, svc, r.Latency.Round(time.Microsecond), r.Banner)
-		}
-		return fmt.Sprintf("%d/%s%s: OK (%s)", r.Port, proto, svc, r.Latency.Round(time.Microsecond))
-	}
-	if r.Status == StatusOpenFiltered {
-		return fmt.Sprintf("%d/%s%s: [%s] no UDP response within %s", r.Port, proto, svc, r.Status, r.Latency.Round(time.Millisecond))
-	}
-	if r.Status == StatusResourceExhausted {
-		return fmt.Sprintf("%d/%s%s: [%s] %v (hint: lower -threads or increase ulimit -n)", r.Port, proto, svc, r.Status, r.Err)
-	}
-	if r.Err != nil {
-		return fmt.Sprintf("%d/%s%s: [%s] %v", r.Port, proto, svc, r.Status, r.Err)
-	}
-	return fmt.Sprintf("%d/%s%s: [%s]", r.Port, proto, svc, r.Status)
-}
-
 // classifyError inspects a dial/read error and categorizes it into a PortStatus.
 func classifyError(err error) PortStatus {
 	if err == nil {
@@ -446,6 +419,15 @@ func validateFlags() error {
 	if *topN < 0 || *topN > len(topPorts) {
 		return fmt.Errorf("-top must be between 1 and %d (got %d)", len(topPorts), *topN)
 	}
+	rangeExplicit := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "range" {
+			rangeExplicit = true
+		}
+	})
+	if rangeExplicit && (*allPorts || *topN > 0) {
+		return errors.New("cannot combine -range with -top or -all")
+	}
 	if *rateLimit < 0 {
 		return fmt.Errorf("-rate cannot be negative (got %d)", *rateLimit)
 	}
@@ -502,9 +484,10 @@ func main() {
 		proto = "udp"
 	}
 
+	cleanHost := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(*host), "]"), "[")
 	cfg := ScanConfig{
 		TargetAddr: resolvedIP,
-		HostHeader: *host,
+		HostHeader: cleanHost,
 		Protocol:   proto,
 		IPVersion:  ipVer,
 		Workers:    workers,

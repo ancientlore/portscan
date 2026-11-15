@@ -310,6 +310,9 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(progCmd, waitForNextResult(m.resultsCh))
 
 	case scanDoneMsg:
+		if m.ctx.Err() != nil {
+			m.summary.Canceled = true
+		}
 		m.summary.Duration = time.Since(m.summary.StartedAt)
 		m.summary.DurationMs = m.summary.Duration.Milliseconds()
 		m.quitting = true
